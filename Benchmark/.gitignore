@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Benchmark run output
+benchmark_results/
+*.jsonl
+*_metrics_c*.json
+*_metrics_all.json
+*_env.json
+*_report.txt
+
+# Locust default outputs
+locust_report*.html
+locust_stats*.csv
+locust_failures*.csv
+locust_exceptions*.csv
+.locust_*
+
+# Ad-hoc output files left in the Benchmark root
+events.jsonl
+probe_samples.jsonl
+report.txt
