@@ -1,2 +1,5 @@
 docker
 python-dotenv
+fastapi
+python-multipart
+uvicorn
