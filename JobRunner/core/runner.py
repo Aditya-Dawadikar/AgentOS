@@ -92,8 +92,10 @@ def run_job(job_id):
         container = client.containers.create(name=container_name,
                                              image='python:3-alpine',
                                              command=['python', '/app/job.py'],
-                                             cpu_quota=5000000,
+                                             nano_cpus=500_000_000,
                                              mem_limit='128m',
+                                             memswap_limit='128m',
+                                             pids_limit=64,
                                              volumes={str(container_data_dir): {'bind': '/data', 'mode': 'rw'}},
                                              healthcheck={'test': ['CMD', 'echo', 'hello from container']})
 
