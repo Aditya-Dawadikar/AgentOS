@@ -55,6 +55,91 @@ The following items are benchmark invariants and must not be changed casually:
 
 If a benchmark invariant must change, the change must be explicit and versioned in this file. Old and new benchmark results must not be compared as if they were equivalent.
 
+## Implementation Model
+
+The benchmark is implemented as a hybrid system with online data collection and offline result calculation.
+
+### Load Generator
+
+The load generator runs outside the JobRunner host. Locust is the default tool, but an equivalent generator may be used if it preserves the same request pattern and reporting semantics.
+
+The load generator is responsible for:
+
+- submitting jobs to `POST /jobs`
+- recording client-side request timing
+- capturing returned `job_id` values
+- polling `GET /jobs/{job_id}/status` until terminal state
+- recording completion timing and terminal outcome
+
+The load generator is the source of truth for user-visible latency and request success or failure.
+
+### Host-Side Probes
+
+Benchmark probes run on the EC2 instance or other host that runs JobRunner.
+
+The host-side probes are responsible for collecting server-side signals during the benchmark window, including:
+
+- count of jobs in `STARTING` or `RUNNING`
+- count of live job containers
+- CPU utilization
+- memory utilization
+- Docker daemon health indicators when available
+
+The host-side probes exist on the JobRunner host because the authoritative runtime state lives there: SQLite job state, Docker container state, monitor processes, and host resource pressure.
+
+### Online Collection
+
+Raw benchmark data is collected online while the test is running.
+
+This includes:
+
+- client-side request and completion events from the load generator
+- periodic host-side samples from the JobRunner host
+- optional application instrumentation for Part 2 step timing
+
+Online collection should be append-only and lightweight so the benchmark instrumentation does not materially distort the system under test.
+
+### Offline Calculation
+
+Final benchmark conclusions are computed offline after the run completes.
+
+This includes:
+
+- latency percentiles
+- throughput
+- active job time series
+- peak observed concurrency
+- average concurrency
+- sustainable concurrency
+- step timing summaries for Part 2
+
+Offline calculation is required so warmup can be excluded, cooldown can be evaluated, backlog drain can be checked, and client-side and host-side signals can be reconciled cleanly.
+
+### Source Placement Rules
+
+Use the following placement rules:
+
+- load generation lives on the external benchmark host
+- server-side probes live on the JobRunner host
+- benchmark reports are generated after joining both datasets
+
+If the benchmark is run from a single machine for local experiments, the same separation of concerns still applies logically even if both components happen to run on one host.
+
+### Default Execution Flow
+
+The standard benchmark flow is:
+
+1. prepare the benchmark environment and record environment metadata
+2. start JobRunner on the target host
+3. start host-side probes on the target host
+4. start the load generator and execute the configured concurrency ladder
+5. stop load generation after the measurement window completes
+6. allow cooldown and verify backlog drain
+7. stop host-side probes
+8. merge raw datasets and compute final benchmark metrics offline
+
+This execution model applies to both warm and cold benchmark modes.
+
 ## Benchmark Phases
 
 ### Phase A: Warm Benchmark
