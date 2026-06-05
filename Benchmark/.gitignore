@@ -11,11 +11,8 @@ env/
 
 # Benchmark run output
 benchmark_results/
+results/
 *.jsonl
-*_metrics_c*.json
-*_metrics_all.json
-*_env.json
-*_report.txt
 
 # Locust default outputs
 locust_report*.html

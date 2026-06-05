@@ -8,10 +8,10 @@ The benchmark is split into two roles:
 
 | Role | Responsibility |
 |---|---|
-| **Load generator** | Submits jobs, polls status, records client-side latency events |
+| **Load generator** | Submits jobs, polls status, writes a per-run summary with per-level metrics |
 | **Host probe** | Samples DB active-job count, Docker container count, CPU, memory — 1 Hz |
 
-After the run, both datasets are merged offline by `analysis/compute_metrics.py` and rendered by `analysis/report.py`.
+After the run, the load generator summary and host probe data can be compared across timestamped result directories.
 
 ## Directory Structure
 
@@ -99,7 +99,7 @@ Option A — **Full concurrency ladder** (1 → 2 → 4 → 8 → 16 → 32 → 
 ```bash
 cd Benchmark
 BENCHMARK_WORKLOAD=sleep_short \
-BENCHMARK_EVENTS_FILE=events.jsonl \
+BENCHMARK_SUMMARY_FILE=summary.json \
 python -m locust \
     -f load_generator/locustfile.py \
     --host http://localhost:8000 \
@@ -111,7 +111,7 @@ Option B — **Single concurrency level** (quick smoke test, ~8 minutes):
 ```bash
 cd Benchmark
 BENCHMARK_WORKLOAD=sleep_short \
-BENCHMARK_EVENTS_FILE=events.jsonl \
+BENCHMARK_SUMMARY_FILE=summary.json \
 BENCHMARK_SINGLE_LEVEL=8 \
 python -m locust \
     -f load_generator/locustfile.py \
@@ -123,21 +123,7 @@ python -m locust \
 
 Switch to the probe terminal and press `Ctrl-C`. It writes a `probe_end` marker and exits cleanly.
 
-### Step 6 — Compute metrics (offline)
-
-Replace `--concurrency` with the level you tested (or `0` if you ran the full ladder without stage tracking):
-
-```bash
-cd Benchmark
-python analysis/compute_metrics.py events.jsonl \
-    --probe-file  probe_samples.jsonl \
-    --concurrency 8 \
-    --output      metrics_c8.json
-```
-
-For the full ladder, pass `--measurement-start` and `--measurement-end` (epoch seconds) per level — the stage transition timestamps are recorded in `events.jsonl` and can be read directly, or use the orchestrator in step 6b.
-
-### Step 6b — Or use the orchestrator (runs steps 3–6 automatically)
+### Step 6 — Or use the orchestrator (runs steps 3–5 automatically)
 
 The orchestrator handles probe startup/shutdown, Locust, and offline analysis in one command:
 
@@ -151,19 +137,7 @@ python run_benchmark.py \
     --output-dir benchmark_results/
 ```
 
-All output files land in `benchmark_results/` with a UTC timestamp prefix.
-
-### Step 7 — Generate the report
-
-```bash
-cd Benchmark
-python analysis/report.py metrics_c8.json
-
-# Multiple levels:
-python analysis/report.py benchmark_results/*_metrics_c*.json \
-    --env benchmark_results/*_env.json \
-    --output benchmark_results/report.txt
-```
+All output files land in `results/<timestamp>/`.
 
 ---
 
@@ -237,7 +211,7 @@ pip install -r requirements.txt
 # On your local machine
 cd Benchmark
 BENCHMARK_WORKLOAD=sleep_short \
-BENCHMARK_EVENTS_FILE=events.jsonl \
+BENCHMARK_SUMMARY_FILE=summary.json \
 python -m locust \
     -f load_generator/locustfile.py \
     --host http://<EC2_PUBLIC_IP>:8000 \
@@ -248,7 +222,7 @@ For a single level:
 
 ```bash
 BENCHMARK_WORKLOAD=sleep_short \
-BENCHMARK_EVENTS_FILE=events.jsonl \
+BENCHMARK_SUMMARY_FILE=summary.json \
 BENCHMARK_SINGLE_LEVEL=16 \
 python -m locust \
     -f load_generator/locustfile.py \
@@ -272,36 +246,12 @@ pkill -f probe.py
 scp ec2-user@<EC2_PUBLIC_IP>:/tmp/probe_samples.jsonl ./probe_samples.jsonl
 ```
 
-### Step 8 — Compute metrics and generate the report locally
+### Step 8 — Compare the summary and probe outputs locally
 
 ```bash
 cd Benchmark
-
-# Per level (example: concurrency=16)
-python analysis/compute_metrics.py events.jsonl \
-    --probe-file  probe_samples.jsonl \
-    --concurrency 16 \
-    --output      metrics_c16.json
-
-# Report
-python analysis/report.py metrics_c16.json
-
-# Capture environment metadata for the report header
-python -c "
-import json, subprocess, platform, datetime
-env = {
-    'date_utc': datetime.datetime.utcnow().isoformat() + 'Z',
-    'ec2_instance_type': '<INSTANCE_TYPE>',
-    'git_commit_sha': subprocess.check_output(['git','rev-parse','HEAD']).decode().strip(),
-    'python_version': platform.python_version(),
-    'benchmark_mode': 'warm',
-    'workload': 'sleep_short',
-}
-print(json.dumps(env, indent=2))
-" > env.json
-
-python analysis/report.py metrics_c*.json --env env.json --output report.txt
-cat report.txt
+ls results/
+cat results/<timestamp>/summary.json
 ```
 
 ### Environment fields required per BENCHMARK.md
@@ -333,7 +283,7 @@ TBD
 | Variable | Default | Description |
 |---|---|---|
 | `BENCHMARK_WORKLOAD` | `sleep_short` | Workload name (`sleep_short`, `sleep_fixed`, `tiny_fast_exit`) |
-| `BENCHMARK_EVENTS_FILE` | `benchmark_events.jsonl` | Output path for load-generator JSONL events |
+| `BENCHMARK_SUMMARY_FILE` | `benchmark_summary.json` | Output path for the per-run summary JSON |
 | `BENCHMARK_POLL_INTERVAL` | `0.5` | Seconds between `GET /jobs/{id}/status` polls |
 | `BENCHMARK_SINGLE_LEVEL` | _(unset)_ | Run only this concurrency level instead of the full ladder |
 
@@ -353,8 +303,6 @@ A concurrency level is **stable** when all of the following hold:
 
 | File | Contents |
 |---|---|
-| `<ts>_env.json` | Environment metadata snapshot |
-| `<ts>_events.jsonl` | Per-job lifecycle events from the load generator |
-| `<ts>_probe.jsonl` | Per-second host samples (DB, Docker, CPU, mem) |
-| `<ts>_metrics_cN.json` | Computed metrics for concurrency level N |
-| `<ts>_report.txt` | Human-readable summary table and verdict |
+| `results/<ts>/env.json` | Environment metadata snapshot |
+| `results/<ts>/summary.json` | Per-run summary with stage and per-concurrency metrics |
+| `results/<ts>/probe.jsonl` | Per-second host samples (DB, Docker, CPU, mem) |
