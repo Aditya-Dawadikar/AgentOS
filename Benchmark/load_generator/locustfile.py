@@ -7,7 +7,7 @@ Implements the submission-and-poll pattern required by BENCHMARK.md:
     - write per-run summary metrics to a JSON file
 
 The BenchmarkShape class drives the default concurrency ladder defined
-in BENCHMARK.md: 1, 2, 4, 8, 16, 32, 64, 128 users with warmup /
+in BENCHMARK.md: 1, 4, 16, 64, 256 users with warmup /
 measurement / cooldown stages per level.
 
 Environment variables:
@@ -22,6 +22,7 @@ import os
 import re
 import threading
 import time
+from uuid import uuid4
 
 from locust import HttpUser, constant, events, task, LoadTestShape
 
@@ -34,11 +35,12 @@ SUMMARY_FILE = os.environ.get("BENCHMARK_SUMMARY_FILE",
                               os.environ.get("BENCHMARK_EVENTS_FILE", "benchmark_summary.json"))
 POLL_INTERVAL = float(os.environ.get("BENCHMARK_POLL_INTERVAL", "0.5"))
 SINGLE_LEVEL = os.environ.get("BENCHMARK_SINGLE_LEVEL")
+BENCHMARK_RUN_ID = os.environ.get("BENCHMARK_RUN_ID")
 
 TERMINAL_STATES = {"SUCCEEDED", "FAILED"}
 
 # Concurrency ladder from BENCHMARK.md
-CONCURRENCY_LADDER = [1, 4, 16, 64, 128]
+CONCURRENCY_LADDER = [1, 4, 16, 64, 256]
 
 # Stage timing in seconds (per concurrency level)
 WARMUP_SECONDS = 5
@@ -145,6 +147,20 @@ def _stage_snapshot() -> dict:
         }
 
 
+def _request_headers(stage_snapshot: dict) -> dict[str, str]:
+    headers = {
+        "X-Benchmark-Request-Id": uuid4().hex,
+        "X-Benchmark-Workload": WORKLOAD,
+    }
+    if BENCHMARK_RUN_ID:
+        headers["X-Benchmark-Run-Id"] = BENCHMARK_RUN_ID
+    if stage_snapshot.get("concurrency_level") is not None:
+        headers["X-Benchmark-Concurrency-Level"] = str(stage_snapshot["concurrency_level"])
+    if stage_snapshot.get("phase"):
+        headers["X-Benchmark-Phase"] = str(stage_snapshot["phase"])
+    return headers
+
+
 def _metrics_from_records(submission_records: list[dict], job_records: list[dict]) -> dict:
     submission_latencies = [record["submission_latency"] for record in submission_records]
     completion_latencies = [record["completion_latency"] for record in job_records if record.get("completion_latency") is not None]
@@ -204,6 +220,7 @@ def _build_summary_payload() -> dict:
     return {
         "run_started_at": _run_started_at,
         "run_finished_at": time.time(),
+        "benchmark_run_id": BENCHMARK_RUN_ID,
         "workload": WORKLOAD,
         "summary_file": _resolved_summary_file,
         **overall_metrics,
@@ -298,6 +315,7 @@ class JobRunnerUser(HttpUser):
             with self.client.post(
                 "/jobs",
                 files={"files": ("job.py", f, "text/plain")},
+                headers=_request_headers(stage_snapshot),
                 name="POST /jobs",
                 catch_response=True,
             ) as resp:

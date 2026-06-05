@@ -24,6 +24,8 @@ Output files land in --output-dir (default: results/) inside a per-run timestamp
     <run_dir>/env.json        environment metadata
     <run_dir>/summary.json    benchmark summary from the load generator
     <run_dir>/probe.jsonl     raw host probe samples
+    <run_dir>/profile_summary.json    request-path timing summary from JobRunner
+    <run_dir>/profile_report.txt      human-readable request-path timing report
 """
 
 import argparse
@@ -39,6 +41,9 @@ import uuid
 
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
+_DEFAULT_PROFILE_EVENTS_FILE = os.path.abspath(
+    os.path.join(_HERE, '..', 'JobRunner', 'data', 'request_profile_events.jsonl')
+)
 
 # ---------------------------------------------------------------------------
 # Environment capture
@@ -102,7 +107,11 @@ def start_probe(db_path: str, output_file: str, interval: float = 1.0) -> subpro
     )
 
 
-def run_locust(host: str, workload: str, summary_file: str, single_level: int = None) -> int:
+def run_locust(host: str,
+               workload: str,
+               summary_file: str,
+               benchmark_run_id: str,
+               single_level: int = None) -> int:
     locustfile = os.path.join(_HERE, "load_generator", "locustfile.py")
     cmd = [
         sys.executable, "-m", "locust",
@@ -114,11 +123,39 @@ def run_locust(host: str, workload: str, summary_file: str, single_level: int = 
     env = os.environ.copy()
     env["BENCHMARK_WORKLOAD"] = workload
     env["BENCHMARK_SUMMARY_FILE"] = summary_file
+    env["BENCHMARK_RUN_ID"] = benchmark_run_id
     if single_level is not None:
         env["BENCHMARK_SINGLE_LEVEL"] = str(single_level)
 
     print(f"  Locust command: {' '.join(cmd)}")
     proc = subprocess.run(cmd, env=env)
+    return proc.returncode
+
+
+def compute_profile_summary(profile_events_file: str, run_id: str, output_file: str) -> int:
+    script = os.path.join(_HERE, 'analysis', 'compute_profile_metrics.py')
+    cmd = [
+        sys.executable,
+        script,
+        profile_events_file,
+        '--run-id', run_id,
+        '--output', output_file,
+    ]
+    print(f"  Profile summary command: {' '.join(cmd)}")
+    proc = subprocess.run(cmd)
+    return proc.returncode
+
+
+def render_profile_report(summary_file: str, output_file: str) -> int:
+    script = os.path.join(_HERE, 'analysis', 'profile_report.py')
+    cmd = [
+        sys.executable,
+        script,
+        summary_file,
+        '--output', output_file,
+    ]
+    print(f"  Profile report command: {' '.join(cmd)}")
+    proc = subprocess.run(cmd)
     return proc.returncode
 
 
@@ -151,6 +188,8 @@ def main():
                         help="Test a single concurrency level instead of the full ladder")
     parser.add_argument("--probe-interval", type=float, default=1.0,
                         help="Host probe sample interval in seconds (default: 1.0)")
+    parser.add_argument("--profile-events-file", default=_DEFAULT_PROFILE_EVENTS_FILE,
+                        help="Path to JobRunner request profile JSONL (default: JobRunner/data/request_profile_events.jsonl)")
     args = parser.parse_args()
 
     run_ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%S")
@@ -158,8 +197,9 @@ def main():
     os.makedirs(run_dir, exist_ok=True)
 
     # 1. Environment metadata
-    print("Step 1/5: Capturing environment metadata...")
+    print("Step 1/6: Capturing environment metadata...")
     env = capture_environment(args)
+    env["profile_events_file"] = args.profile_events_file
     env_file = os.path.join(run_dir, "env.json")
     with open(env_file, "w") as fh:
         json.dump(env, fh, indent=2)
@@ -171,13 +211,13 @@ def main():
 
     # 2. Start host probe
     probe_file = os.path.join(run_dir, "probe.jsonl")
-    print(f"\nStep 2/5: Starting host-side probe -> {probe_file}")
+    print(f"\nStep 2/6: Starting host-side probe -> {probe_file}")
     probe_proc = start_probe(args.db, probe_file, interval=args.probe_interval)
 
     try:
         # 3. Run load generator
         summary_file = os.path.join(run_dir, "summary.json")
-        print(f"\nStep 3/5: Running load generator -> {summary_file}")
+        print(f"\nStep 3/6: Running load generator -> {summary_file}")
         if args.single_level:
             print(f"  Mode: single level (concurrency={args.single_level})")
         else:
@@ -187,6 +227,7 @@ def main():
             host=args.host,
             workload=args.workload,
             summary_file=summary_file,
+            benchmark_run_id=env['run_id'],
             single_level=args.single_level,
         )
         if rc != 0:
@@ -194,15 +235,36 @@ def main():
 
     finally:
         # 4. Stop probe
-        print("\nStep 4/5: Stopping host-side probe...")
+        print("\nStep 4/6: Stopping host-side probe...")
         probe_proc.terminate()
         try:
             probe_proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             probe_proc.kill()
 
-    # 5. Persist run artifacts
-    print("\nStep 5/5: Finalizing summary artifacts...")
+    profile_summary_file = os.path.join(run_dir, 'profile_summary.json')
+    profile_report_file = os.path.join(run_dir, 'profile_report.txt')
+    profile_summary_created = False
+    profile_report_created = False
+
+    # 5. Compute request-path profile summary
+    print("\nStep 5/6: Computing request-path profile summary...")
+    if os.path.isfile(args.profile_events_file):
+        profile_rc = compute_profile_summary(args.profile_events_file, env['run_id'], profile_summary_file)
+        if profile_rc == 0 and os.path.isfile(profile_summary_file):
+            profile_summary_created = True
+            report_rc = render_profile_report(profile_summary_file, profile_report_file)
+            if report_rc == 0 and os.path.isfile(profile_report_file):
+                profile_report_created = True
+            else:
+                print(f"  WARNING: Profile report generation failed with code {report_rc}")
+        else:
+            print(f"  WARNING: Profile summary generation failed with code {profile_rc}")
+    else:
+        print(f"  WARNING: profile events file not found: {args.profile_events_file}")
+
+    # 6. Persist run artifacts
+    print("\nStep 6/6: Finalizing summary artifacts...")
 
     print("\n" + "=" * 60)
     print("Benchmark complete.")
@@ -210,6 +272,10 @@ def main():
     print(f"  Environment      : {env_file}")
     print(f"  Summary          : {summary_file}")
     print(f"  Probe samples    : {probe_file}")
+    if profile_summary_created:
+        print(f"  Profile summary  : {profile_summary_file}")
+    if profile_report_created:
+        print(f"  Profile report   : {profile_report_file}")
     print("=" * 60)
 
 

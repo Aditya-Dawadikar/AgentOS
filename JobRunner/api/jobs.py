@@ -4,17 +4,45 @@ from pathlib import Path
 from typing import Annotated
 from uuid import uuid4
 import shutil
+import time
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 
 from app_logging import get_logger
 from db import get_job, list_jobs
 from api.models import ArtifactEntry, JobArtifactsResponse, JobDetailResponse, JobResponse, JobStatusResponse, JobSubmissionForm, JobSubmissionRequest, JobLogLinks
+from core.request_profiling import append_profile_event
 from core.runner import data_root, jobs_root, run_job
 
 
 router = APIRouter(prefix='/jobs', tags=['jobs'])
 logger = get_logger(__name__)
+
+
+def _elapsed_ms(started_at: float) -> float:
+    return round((time.perf_counter() - started_at) * 1000, 3)
+
+
+def _parse_int_header(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
+
+
+def _request_profile_context(request: Request) -> dict[str, object]:
+    return {
+        'request_id': request.headers.get('X-Benchmark-Request-Id') or uuid4().hex,
+        'benchmark_run_id': request.headers.get('X-Benchmark-Run-Id'),
+        'concurrency_level': _parse_int_header(request.headers.get('X-Benchmark-Concurrency-Level')),
+        'phase': request.headers.get('X-Benchmark-Phase'),
+        'workload': request.headers.get('X-Benchmark-Workload'),
+        'request_path': request.url.path,
+        'request_method': request.method,
+        'client': request.client.host if request.client else None,
+    }
 
 
 def _safe_job_path(job_id: str) -> Path:
@@ -60,20 +88,33 @@ def _artifact_entries(job_id: str) -> list[ArtifactEntry]:
 
 
 @router.post('', status_code=202, response_model=JobResponse)
-async def submit_job(job_id: Annotated[str | None, Form()] = None,
+async def submit_job(request: Request,
+                     job_id: Annotated[str | None, Form()] = None,
                      files: list[UploadFile] = File(...)) -> JobResponse:
     if not files:
         logger.warning('job_submission_rejected reason=no_files')
         raise HTTPException(status_code=400, detail='At least one file must be uploaded')
 
+    request_started_at = time.perf_counter()
+    phase_timings: dict[str, float] = {}
+    runner_profile: dict[str, object] = {'phases_ms': {}}
+    profile_event = _request_profile_context(request)
+    total_upload_bytes = 0
+    accepted = False
+    status_code = 500
+    error_message: str | None = None
+
     JobSubmissionForm(files=[upload.filename or '' for upload in files], job_id=job_id)
-    request = JobSubmissionRequest(job_id=job_id)
-    job_id = request.job_id or uuid4().hex
+    submission_request = JobSubmissionRequest(job_id=job_id)
+    job_id = submission_request.job_id or uuid4().hex
     job_dir = _safe_job_path(job_id)
     logger.info('job_submission_received job_id=%s file_count=%s', job_id, len(files))
+    job_dir_started_at = time.perf_counter()
     job_dir.mkdir(parents=True, exist_ok=False)
+    phase_timings['job_dir_prepare_ms'] = _elapsed_ms(job_dir_started_at)
 
     try:
+        file_persist_started_at = time.perf_counter()
         for upload in files:
             relative_path = _safe_relative_upload_path(upload.filename or '')
             destination = job_dir / relative_path
@@ -81,26 +122,57 @@ async def submit_job(job_id: Annotated[str | None, Form()] = None,
 
             with destination.open('wb') as output_file:
                 shutil.copyfileobj(upload.file, output_file)
+            total_upload_bytes += destination.stat().st_size
+        phase_timings['file_persist_ms'] = _elapsed_ms(file_persist_started_at)
 
-        if not (job_dir / 'job.py').is_file():
+        validation_started_at = time.perf_counter()
+        has_job_py = (job_dir / 'job.py').is_file()
+        phase_timings['job_bundle_validation_ms'] = _elapsed_ms(validation_started_at)
+        if not has_job_py:
             logger.warning('job_submission_rejected job_id=%s reason=missing_job_py', job_id)
             raise HTTPException(status_code=400, detail='Submitted job must include job.py')
 
-        response = _job_response(run_job(job_id))
+        response = _job_response(run_job(job_id, profile=runner_profile))
+        accepted = True
+        status_code = 202
         logger.info('job_submission_accepted job_id=%s container_id=%s',
                     response.job_id,
                     response.container_id)
         return response
-    except HTTPException:
+    except HTTPException as error:
+        status_code = error.status_code
+        error_message = str(error.detail)
         shutil.rmtree(job_dir, ignore_errors=True)
         raise
     except Exception as error:
+        status_code = 500
+        error_message = str(error)
         shutil.rmtree(job_dir, ignore_errors=True)
         logger.exception('job_submission_failed job_id=%s error=%s', job_id, error)
         raise HTTPException(status_code=500, detail=str(error)) from error
     finally:
         for upload in files:
             await upload.close()
+
+        phases = dict(phase_timings)
+        phases.update(runner_profile.get('phases_ms', {}))
+        phases['request_total_ms'] = _elapsed_ms(request_started_at)
+
+        profile_event.update({
+            'job_id': job_id,
+            'accepted': accepted,
+            'status_code': status_code,
+            'file_count': len(files),
+            'upload_bytes': total_upload_bytes,
+            'phases_ms': phases,
+        })
+        if runner_profile.get('archive_bytes') is not None:
+            profile_event['archive_bytes'] = runner_profile['archive_bytes']
+        if runner_profile.get('container_id') is not None:
+            profile_event['container_id'] = runner_profile['container_id']
+        if error_message is not None:
+            profile_event['error_message'] = error_message
+        append_profile_event(profile_event)
 
 
 @router.get('', response_model=list[JobResponse])

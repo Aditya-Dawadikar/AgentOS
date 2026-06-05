@@ -2,6 +2,8 @@
 
 This directory contains all benchmark tooling for the AgentOS JobRunner, implementing the contract defined in [`BENCHMARK.md`](../BENCHMARK.md).
 
+For request-path timing and profiling workflow details, see [REQUEST_PROFILING.md](REQUEST_PROFILING.md).
+
 ## Overview
 
 The benchmark is split into two roles:
@@ -30,6 +32,7 @@ Benchmark/
 ├── analysis/
 │   ├── compute_metrics.py      # offline metric computation
 │   └── report.py               # human-readable summary table
+├── REQUEST_PROFILING.md        # request-path profiling guide
 ├── run_benchmark.py            # end-to-end orchestrator
 └── requirements.txt            # all benchmark dependencies
 ```
